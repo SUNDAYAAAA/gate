@@ -47,9 +47,11 @@ CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 # ---- 质量闸门配置 (v2 新增) ----
-MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "3000"))   # 延迟闸门: 超过即杀
+MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "4000"))   # 延迟闸门: 超过即杀 (线上实测中位~4s, 3s仅剩3只, 4s平衡数量与体验)
 RECHECK_ROUNDS = int(os.environ.get("RECHECK_ROUNDS", "2"))      # 两轮全过才留 (防 Flapping)
 MIN_KEEP_NODES = int(os.environ.get("MIN_KEEP_NODES", "12"))     # 闸门后不足则按延迟回填最猛的
+MAX_SESSIONS = int(os.environ.get("MAX_SESSIONS", "40"))         # 活跃会话>40 视为拥挤沉底
+HANDSHAK_MAX_MS = int(os.environ.get("HANDSHAK_MAX_MS", "8000")) # 握手硬上限(只是建链耗时,不代表速度)
 # 运营商优选API (逗号分隔, CARRIER 选一个; 空串=只用静态 EDGE_HOSTS)
 OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=8&port=443,https://cf.090227.xyz/cu?ips=8&port=443,https://cf.090227.xyz/cmcc?ips=8&port=443")
 CARRIER = os.environ.get("CARRIER", "cmcc")   # 老大手机=移动; 可选 ct/cu/cmcc/all
@@ -156,7 +158,10 @@ def parse_csv(text):
             if "base64" in h.lower():
                 idx["openvpn_configdata_base64"] = i
                 break
-    pos = {"hostname": idx.get("hostname", 0), "ip": idx.get("ip", 1), "countrylong": idx.get("countrylong", 5), "countryshort": idx.get("countryshort", 6), "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1)}
+    pos = {"hostname": idx.get("hostname", 0), "ip": idx.get("ip", 1), "score": idx.get("score"), "ping": idx.get("ping"),
+           "speed": idx.get("speed"), "countrylong": idx.get("countrylong", 5), "countryshort": idx.get("countryshort", 6),
+           "numvpnsessions": idx.get("numvpnsessions"), "totalusers": idx.get("totalusers"),
+           "openvpn_configdata_base64": idx.get("openvpn_configdata_base64", len(header) - 1)}
 
     rows = []
     for ln in data_lines:
@@ -165,7 +170,17 @@ def parse_csv(text):
         host = fields[pos["hostname"]].strip()
         ip = fields[pos["ip"]].strip()
         if not host or not ip: continue
-        rows.append({"host": host, "ip": ip, "country_long": fields[pos["countrylong"]].strip(), "country_short": fields[pos["countryshort"]].strip(), "config_b64": fields[pos["openvpn_configdata_base64"]].strip()})
+
+        def num(key, default=None):
+            i = pos.get(key)
+            if i is None or i >= len(fields): return default
+            v = fields[i].strip().replace(",", "")
+            try: return float(v)
+            except (TypeError, ValueError): return default
+
+        rows.append({"host": host, "ip": ip, "country_long": fields[pos["countrylong"]].strip(), "country_short": fields[pos["countryshort"]].strip(), "config_b64": fields[pos["openvpn_configdata_base64"]].strip(),
+                     "ping_ms": num("ping"), "server_bps": num("speed"), "active_sessions": num("numvpnsessions"),
+                     "total_users": num("totalusers"), "score": num("score")})
     return rows
 
 def parse_mirror_json(data):
@@ -181,7 +196,17 @@ def parse_mirror_json(data):
         host = str(s.get("hostname") or s.get("host") or "").strip()
         ip = str(s.get("ip") or "").strip()
         if not host or not ip: continue
-        rows.append({"host": host, "ip": ip, "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(), "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(), "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip()})
+
+        def num(*keys):
+            for k in keys:
+                v = str(s.get(k) or "").replace(",", "").strip()
+                try: return float(v)
+                except ValueError: continue
+            return None
+
+        rows.append({"host": host, "ip": ip, "country_long": str(s.get("countrylong") or s.get("country_long") or s.get("country") or "").strip(), "country_short": str(s.get("countryshort") or s.get("country_short") or "").strip(), "config_b64": str(s.get("openvpn_configdata_base64") or s.get("config_b64") or "").strip(),
+                     "ping_ms": num("ping"), "server_bps": num("speed"), "active_sessions": num("numvpnsessions"),
+                     "total_users": num("totalusers"), "score": num("score")})
     return rows
 
 # ---------------------------------------------------------------------------
@@ -207,7 +232,9 @@ def to_sstp_nodes(rows):
         host = r["host"]
         if not host.endswith(".opengw.net"):
             host = f"{host}.opengw.net"
-        nodes.append({"host": host, "port": port, "ip": r["ip"], "country": r["country_long"], "country_code": r["country_short"]})
+        nodes.append({"host": host, "port": port, "ip": r["ip"], "country": r["country_long"], "country_code": r["country_short"],
+                      "ping_ms": r.get("ping_ms"), "server_bps": r.get("server_bps"),
+                      "active_sessions": r.get("active_sessions"), "score": r.get("score")})
     return nodes
 
 def dedupe(nodes):
@@ -340,23 +367,67 @@ def check_all(nodes, session):
             results.append(fut.result())
     return results
 
+# ---------------------------------------------------------------------------
+# 兵质量分 (v3 核心): VPN Gate 官方自报画像 > Worker 握手延迟
+#   握手延迟(responseTime)测的是 CF→节点 的 SSTP 隧道建链耗时, 与"有没有速度"弱相关;
+#   官方 Speed(bps)/NumVpnSessions 才是"每会话可分带宽", 直接决定体感速度。
+# ---------------------------------------------------------------------------
+NEAR_CODES = {c.strip() for c in os.environ.get("NEAR_CODES", "JP,KR,TW,HK,VN,SG,TH,PH,MY").split(",") if c.strip()}
+
+def est_per_session_kbps(r):
+    """官方自报带宽 ÷ (活跃会话+1) = 每会话可分带宽 (KB/s), 未知记 None"""
+    bps, sess = r.get("server_bps"), r.get("active_sessions")
+    if not bps:
+        return None
+    return bps / 8.0 / ((sess or 0) + 1) / 1024.0
+
+def quality_score(r):
+    """越大越优。真数据不足时回落到握手延迟, 绝不凭空编造排名"""
+    kbps = est_per_session_kbps(r)
+    s = 0.0
+    if kbps is not None:
+        s += min(kbps, 20000) * 1.0          # 每会话带宽封顶2万KB/s(避免异常值主导)
+        if (r.get("active_sessions") or 0) > MAX_SESSIONS:
+            s -= 1e6                          # 人挤爆的直接沉底
+    ping = r.get("ping_ms")
+    if ping is not None:
+        s -= min(ping, 500) * 8.0
+    if (r.get("country_code") or "").upper() in NEAR_CODES:
+        s += 6000                             # 近端(东亚/东南亚)加权
+    if r.get("residential") == "residential":
+        s += 2500
+    if r.get("rounds_ok", 0) >= RECHECK_ROUNDS:
+        s += 2000
+    lat = r.get("latency_ms")
+    if kbps is None and lat:                  # 无官方画像才用握手延迟兜底
+        s -= min(lat, 12000) * 0.5
+    return s
+
 def check_with_recheck(nodes, session):
-    """多轮复测防 Flapping: 每轮只复测上轮幸存者, 最终延迟取各轮最小值并打上 rounds_ok 标记"""
+    """多轮复测防 Flapping: 每轮复测上轮'活着'的节点(不看延迟), 最终延迟取各轮最小值并打上 rounds_ok 标记"""
     survivors = list(nodes)
     merged = {}  # host:port -> best result dict
     for rnd in range(1, RECHECK_ROUNDS + 1):
         log("CLOUDFLARE WORKER", f"第 {rnd}/{RECHECK_ROUNDS} 轮检测: {len(survivors)} 个候选")
         results = check_all(survivors, session)
         next_survivors = []
+        alive = 0
+        lats = []
         for r in results:
             key = f"{r['host']}:{r['port']}"
             lat = r.get("latency_ms")
-            ok = bool(r.get("success")) and lat is not None and 0 < lat <= MAX_LATENCY_MS
-            if key not in merged or (lat is not None and (merged[key].get("latency_ms") is None or lat < merged[key]["latency_ms"])):
+            if lat is not None and lat > 0:
+                lats.append(lat)
+            if key not in merged or (lat is not None and 0 < lat and (merged[key].get("latency_ms") is None or lat < merged[key]["latency_ms"])):
                 merged[key] = r
-            if ok:
+            is_alive = bool(r.get("success")) and lat is not None and lat > 0  # 活着就进下一轮复测, 延迟闸门在出口把关
+            if is_alive:
+                alive += 1
                 merged[key]["rounds_ok"] = merged[key].get("rounds_ok", 0) + 1
-                next_survivors.append(r)  # 结果字典含 host/port/节点字段, 可直接复测
+                next_survivors.append(r)
+        if lats:
+            lats.sort()
+            log("CLOUDFLARE WORKER", f"本轮存活 {alive}/{len(results)}; 延迟分布 min={lats[0]} med={lats[len(lats)//2]} p90={lats[int(len(lats)*0.9)]} max={lats[-1]}")
         survivors = next_survivors
     return list(merged.values()), survivors
 
@@ -364,19 +435,26 @@ def check_with_recheck(nodes, session):
 # 生成数据
 # ---------------------------------------------------------------------------
 def build_outputs(results, raw_count, sstp_count, source):
-    # 质量闸门: 两轮全过 + 延迟达标才算可用; 不足 MIN_KEEP_NODES 则按延迟回填
-    ok_nodes = [r for r in results if r.get("success") and r.get("rounds_ok", 0) >= RECHECK_ROUNDS
-                and r.get("latency_ms") is not None and 0 < r["latency_ms"] <= MAX_LATENCY_MS]
-    if len(ok_nodes) < MIN_KEEP_NODES:
-        # 回填池: 至少一轮通过且延迟<=闸门, 按 (过轮数降序, 延迟升序) 补
-        ok_ids = {id(r) for r in ok_nodes}
-        pool = [r for r in results if r.get("success") and r.get("latency_ms") is not None
-                and 0 < r["latency_ms"] <= MAX_LATENCY_MS and id(r) not in ok_ids]
-        pool.sort(key=lambda r: (-r.get("rounds_ok", 0), r["latency_ms"]))
-        need = MIN_KEEP_NODES - len(ok_nodes)
-        log("GATE", f"[WARN] 两轮全过仅 {len(ok_nodes)} 个, 按延迟回填至多 {need} 个 (宁缺勿滥仍受 {MAX_LATENCY_MS}ms 闸门约束)")
-        ok_nodes = ok_nodes + pool[:need]
-    available = ok_nodes
+    # v3 质量闸门: 两轮存活 + 握手不超硬上限 → 入围; 排序看官方画像(每会话带宽), 不看握手延迟
+    alive = [r for r in results if r.get("success")
+             and r.get("latency_ms") is not None and 0 < r["latency_ms"] <= HANDSHAK_MAX_MS]
+    two_round = [r for r in alive if r.get("rounds_ok", 0) >= RECHECK_ROUNDS]
+    for r in alive:
+        r["quality"] = round(quality_score(r), 1)
+        r["per_session_kbps"] = (round(est_per_session_kbps(r), 1) if est_per_session_kbps(r) is not None else None)
+    # 主选: 两轮全过, 按质量分降序; 不足则从"单轮存活"回填
+    ranked = sorted(two_round, key=lambda r: -r["quality"])
+    if len(ranked) < MIN_KEEP_NODES:
+        rest = [r for r in alive if id(r) not in {id(x) for x in ranked}]
+        rest.sort(key=lambda r: -r["quality"])
+        log("GATE", f"[WARN] 两轮全过仅 {len(ranked)} 个, 按质量分回填至多 {MIN_KEEP_NODES - len(ranked)} 个")
+        ranked = ranked + rest[:MIN_KEEP_NODES - len(ranked)]
+    # 拥挤沉底的不进成品 (quality 里已 -1e6, 但仍可能因回填混入 → 显式剔除)
+    available = [r for r in ranked if (r.get("active_sessions") or 0) <= MAX_SESSIONS]
+    if available:
+        kbps_list = sorted([r["per_session_kbps"] for r in available if r["per_session_kbps"] is not None])
+        if kbps_list:
+            log("GATE", f"成品每会话可分带宽: min={kbps_list[0]:.0f} med={kbps_list[len(kbps_list)//2]:.0f} max={kbps_list[-1]:.0f} KB/s; 握手 med={sorted(r['latency_ms'] for r in available)[len(available)//2]}ms")
     countries = {}
     for n in available:
         c = n["country"] or "未知"
@@ -388,7 +466,7 @@ def build_outputs(results, raw_count, sstp_count, source):
         grp["count"] = len(grp["nodes"])
         grp["residential"] = sum(1 for n in grp["nodes"] if n["residential"] == "residential")
         grp["datacenter"] = sum(1 for n in grp["nodes"] if n["residential"] == "datacenter")
-        grp["nodes"].sort(key=lambda n: (n.get("latency_ms") is None, n.get("latency_ms") or 0, n["host"]))
+        grp["nodes"].sort(key=lambda n: (-(n.get("quality") or 0), n["host"]))
         by_country[name] = grp
 
     data = {"generated_at": datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC"), "source": source, "worker": WORKER_CHECK_URL, "stats": stats, "countries": by_country, "available": available}
@@ -401,7 +479,7 @@ EDGE_HOSTS = [
         "EDGE_HOSTS",
         "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,"
         "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
-        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,www.bilibili.com:443,uspto.gov:443,www.vmware.com:443",
+        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,uspto.gov:443,www.vmware.com:443",
     ).split(",")
     if h.strip()
 ]
