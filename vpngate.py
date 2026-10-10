@@ -47,7 +47,7 @@ CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 # ---- 质量闸门配置 (v2 新增) ----
-MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "3000"))   # 延迟闸门: 超过即杀
+MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "4000"))   # 延迟闸门: 超过即杀 (线上实测中位~4s, 3s仅剩3只, 4s平衡数量与体验)
 RECHECK_ROUNDS = int(os.environ.get("RECHECK_ROUNDS", "2"))      # 两轮全过才留 (防 Flapping)
 MIN_KEEP_NODES = int(os.environ.get("MIN_KEEP_NODES", "12"))     # 闸门后不足则按延迟回填最猛的
 # 运营商优选API (逗号分隔, CARRIER 选一个; 空串=只用静态 EDGE_HOSTS)
@@ -409,7 +409,7 @@ EDGE_HOSTS = [
         "EDGE_HOSTS",
         "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,"
         "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
-        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,www.bilibili.com:443,uspto.gov:443,www.vmware.com:443",
+        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,uspto.gov:443,www.vmware.com:443",
     ).split(",")
     if h.strip()
 ]
