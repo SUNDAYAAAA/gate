@@ -47,7 +47,7 @@ CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
 # ---- 质量闸门配置 (v2 新增) ----
-MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "4000"))   # 延迟闸门: 超过即杀 (线上实测中位~4s, 3s仅剩3只, 4s平衡数量与体验)
+MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "3000"))   # 延迟闸门: 超过即杀
 RECHECK_ROUNDS = int(os.environ.get("RECHECK_ROUNDS", "2"))      # 两轮全过才留 (防 Flapping)
 MIN_KEEP_NODES = int(os.environ.get("MIN_KEEP_NODES", "12"))     # 闸门后不足则按延迟回填最猛的
 # 运营商优选API (逗号分隔, CARRIER 选一个; 空串=只用静态 EDGE_HOSTS)
@@ -341,30 +341,22 @@ def check_all(nodes, session):
     return results
 
 def check_with_recheck(nodes, session):
-    """多轮复测防 Flapping: 每轮复测上轮'活着'的节点(不看延迟), 最终延迟取各轮最小值并打上 rounds_ok 标记"""
+    """多轮复测防 Flapping: 每轮只复测上轮幸存者, 最终延迟取各轮最小值并打上 rounds_ok 标记"""
     survivors = list(nodes)
     merged = {}  # host:port -> best result dict
     for rnd in range(1, RECHECK_ROUNDS + 1):
         log("CLOUDFLARE WORKER", f"第 {rnd}/{RECHECK_ROUNDS} 轮检测: {len(survivors)} 个候选")
         results = check_all(survivors, session)
         next_survivors = []
-        alive = 0
-        lats = []
         for r in results:
             key = f"{r['host']}:{r['port']}"
             lat = r.get("latency_ms")
-            if lat is not None and lat > 0:
-                lats.append(lat)
-            if key not in merged or (lat is not None and 0 < lat and (merged[key].get("latency_ms") is None or lat < merged[key]["latency_ms"])):
+            ok = bool(r.get("success")) and lat is not None and 0 < lat <= MAX_LATENCY_MS
+            if key not in merged or (lat is not None and (merged[key].get("latency_ms") is None or lat < merged[key]["latency_ms"])):
                 merged[key] = r
-            is_alive = bool(r.get("success")) and lat is not None and lat > 0  # 活着就进下一轮复测, 延迟闸门在出口把关
-            if is_alive:
-                alive += 1
+            if ok:
                 merged[key]["rounds_ok"] = merged[key].get("rounds_ok", 0) + 1
-                next_survivors.append(r)
-        if lats:
-            lats.sort()
-            log("CLOUDFLARE WORKER", f"本轮存活 {alive}/{len(results)}; 延迟分布 min={lats[0]} med={lats[len(lats)//2]} p90={lats[int(len(lats)*0.9)]} max={lats[-1]}")
+                next_survivors.append(r)  # 结果字典含 host/port/节点字段, 可直接复测
         survivors = next_survivors
     return list(merged.values()), survivors
 
@@ -409,7 +401,7 @@ EDGE_HOSTS = [
         "EDGE_HOSTS",
         "saas.sin.fan:443,cdn.204910.best:443,www.mfyx.cn:443,p.etime.vip:443,cdn.ctn32.us.kg:443,cf.877774.xyz:443,spring.io:443,"
         "cf.nyanya.moe:443,www.sloomb.com:443,op.chinwa.eu.cc:443,www.leics.police.uk:443,securecircle.com:443,www.shopify.com:443,"
-        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,uspto.gov:443,www.vmware.com:443",
+        "www.carousell.sg:443,www.dbs.com.sg:443,openai.com:443,linear.app:443,www.bilibili.com:443,uspto.gov:443,www.vmware.com:443",
     ).split(",")
     if h.strip()
 ]
