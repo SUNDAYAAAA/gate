@@ -148,7 +148,8 @@ def parse_csv(text):
     header = lines[header_idx].lstrip("#").split(",")
     data_lines = lines[header_idx + 1:]
     idx = {}
-    for col in ("hostname", "ip", "countrylong", "countryshort", "openvpn_configdata_base64"):
+    for col in ("hostname", "ip", "countrylong", "countryshort", "openvpn_configdata_base64",
+                "score", "ping", "speed", "numvpnsessions", "totalusers"):
         for i, h in enumerate(header):
             if h.strip().lstrip("*").lower() == col:
                 idx[col] = i
