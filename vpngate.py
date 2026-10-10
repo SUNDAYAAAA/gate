@@ -13,6 +13,7 @@ VPN Gate SSTP 节点检测流水线 (精简版)
 import base64
 import csv
 import io
+import ipaddress
 import json
 import os
 import re
@@ -45,6 +46,14 @@ CONCURRENCY = max(1, int(os.environ.get("CHECK_CONCURRENCY", "32")))
 CHECK_TIMEOUT = float(os.environ.get("CHECK_TIMEOUT", "90"))
 MAX_CHECK_NODES = int(os.environ.get("MAX_CHECK_NODES", "0"))
 HTTP_TIMEOUT = int(os.environ.get("HTTP_TIMEOUT", "60"))
+# ---- 质量闸门配置 (v2 新增) ----
+MAX_LATENCY_MS = int(os.environ.get("MAX_LATENCY_MS", "3000"))   # 延迟闸门: 超过即杀
+RECHECK_ROUNDS = int(os.environ.get("RECHECK_ROUNDS", "2"))      # 两轮全过才留 (防 Flapping)
+MIN_KEEP_NODES = int(os.environ.get("MIN_KEEP_NODES", "12"))     # 闸门后不足则按延迟回填最猛的
+# 运营商优选API (逗号分隔, CARRIER 选一个; 空串=只用静态 EDGE_HOSTS)
+OPTIMAL_API = os.environ.get("OPTIMAL_API", "https://cf.090227.xyz/ct?ips=8&port=443,https://cf.090227.xyz/cu?ips=8&port=443,https://cf.090227.xyz/cmcc?ips=8&port=443")
+CARRIER = os.environ.get("CARRIER", "cmcc")   # 老大手机=移动; 可选 ct/cu/cmcc/all
+CF_IPS_URL = os.environ.get("CF_IPS_URL", "https://api.cloudflare.com/client/v4/ips")
 PUBLIC_DIR = os.environ.get("PUBLIC_DIR", os.path.join(REPO_DIR, "public"))
 TEMPLATE_HTML = os.path.join(REPO_DIR, "web", "index.html")
 
@@ -212,6 +221,67 @@ def dedupe(nodes):
     return out
 
 # ---------------------------------------------------------------------------
+# 入口优选: 运营商优选API + CF官方段净化 (v2 新增)
+# ---------------------------------------------------------------------------
+_cf_nets_cache = None
+
+def cf_nets(session):
+    """CF 官方 IPv4 段, 拿不到就返回 None (降级不过滤)"""
+    global _cf_nets_cache
+    if _cf_nets_cache is not None:
+        return _cf_nets_cache
+    try:
+        j = session.get(CF_IPS_URL, timeout=30).json()
+        nets = [ipaddress.ip_network(c if isinstance(c, str) else c["cidr"]) for c in j["result"]["ipv4_cidrs"]]
+        _cf_nets_cache = nets
+        return nets
+    except Exception as exc:
+        log("EDGE", f"CF 官方段获取失败, 本次不做纯度过滤: {exc}")
+        return None
+
+def is_cf_ip(ip, nets):
+    try:
+        a = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return any(a in n for n in nets)
+
+def fetch_optimal_edges(session):
+    """拉运营商优选API, 按 CARRIER 过滤, 再用 CF 官方段验尸去伪。返回 ['ip:443', ...]"""
+    if not OPTIMAL_API.strip():
+        return []
+    nets = cf_nets(session)
+    key_map = {"ct": ("电信",), "cu": ("联通",), "cmcc": ("移动",), "all": ("电信", "联通", "移动", "优选")}
+    allow = key_map.get(CARRIER, key_map["cmcc"])
+    out, seen, dropped = [], set(), 0
+    for u in [x.strip() for x in OPTIMAL_API.split(",") if x.strip()]:
+        try:
+            txt = session.get(u, timeout=30, headers={"User-Agent": "Mozilla/5.0 (gate-checker)"}).text
+        except Exception as exc:
+            log("EDGE", f"优选API失败 {u}: {exc}")
+            continue
+        for ln in txt.splitlines():
+            ln = ln.strip()
+            if not ln or "#" not in ln and not re.match(r"^\d", ln):
+                continue
+            ip_part, _, remark = ln.partition("#")
+            ip_part = ip_part.split(":")[0].strip()
+            if not re.match(r"^\d+\.\d+\.\d+\.\d+$", ip_part):
+                continue
+            if CARRIER != "all" and remark and not any(k in remark for k in allow):
+                continue
+            if nets is not None and not is_cf_ip(ip_part, nets):
+                dropped += 1
+                continue
+            entry = f"{ip_part}:443"
+            if entry in seen:
+                continue
+            seen.add(entry)
+            out.append(entry)
+    log("EDGE", f"优选API: 收 {len(out)} (CARRIER={CARRIER}, 剔除非CF假优选 {dropped})")
+    return out
+
+# ---------------------------------------------------------------------------
 # 检测 Worker
 # ---------------------------------------------------------------------------
 def classify_network(host, exit_org, is_datacenter=None):
@@ -270,11 +340,43 @@ def check_all(nodes, session):
             results.append(fut.result())
     return results
 
+def check_with_recheck(nodes, session):
+    """多轮复测防 Flapping: 每轮只复测上轮幸存者, 最终延迟取各轮最小值并打上 rounds_ok 标记"""
+    survivors = list(nodes)
+    merged = {}  # host:port -> best result dict
+    for rnd in range(1, RECHECK_ROUNDS + 1):
+        log("CLOUDFLARE WORKER", f"第 {rnd}/{RECHECK_ROUNDS} 轮检测: {len(survivors)} 个候选")
+        results = check_all(survivors, session)
+        next_survivors = []
+        for r in results:
+            key = f"{r['host']}:{r['port']}"
+            lat = r.get("latency_ms")
+            ok = bool(r.get("success")) and lat is not None and 0 < lat <= MAX_LATENCY_MS
+            if key not in merged or (lat is not None and (merged[key].get("latency_ms") is None or lat < merged[key]["latency_ms"])):
+                merged[key] = r
+            if ok:
+                merged[key]["rounds_ok"] = merged[key].get("rounds_ok", 0) + 1
+                next_survivors.append(r)  # 结果字典含 host/port/节点字段, 可直接复测
+        survivors = next_survivors
+    return list(merged.values()), survivors
+
 # ---------------------------------------------------------------------------
 # 生成数据
 # ---------------------------------------------------------------------------
 def build_outputs(results, raw_count, sstp_count, source):
-    available = [r for r in results if r.get("success")]
+    # 质量闸门: 两轮全过 + 延迟达标才算可用; 不足 MIN_KEEP_NODES 则按延迟回填
+    ok_nodes = [r for r in results if r.get("success") and r.get("rounds_ok", 0) >= RECHECK_ROUNDS
+                and r.get("latency_ms") is not None and 0 < r["latency_ms"] <= MAX_LATENCY_MS]
+    if len(ok_nodes) < MIN_KEEP_NODES:
+        # 回填池: 至少一轮通过且延迟<=闸门, 按 (过轮数降序, 延迟升序) 补
+        ok_ids = {id(r) for r in ok_nodes}
+        pool = [r for r in results if r.get("success") and r.get("latency_ms") is not None
+                and 0 < r["latency_ms"] <= MAX_LATENCY_MS and id(r) not in ok_ids]
+        pool.sort(key=lambda r: (-r.get("rounds_ok", 0), r["latency_ms"]))
+        need = MIN_KEEP_NODES - len(ok_nodes)
+        log("GATE", f"[WARN] 两轮全过仅 {len(ok_nodes)} 个, 按延迟回填至多 {need} 个 (宁缺勿滥仍受 {MAX_LATENCY_MS}ms 闸门约束)")
+        ok_nodes = ok_nodes + pool[:need]
+    available = ok_nodes
     countries = {}
     for n in available:
         c = n["country"] or "未知"
@@ -306,11 +408,10 @@ EDGE_HOSTS = [
 
 NODES_URL = os.environ.get("NODES_URL", "https://SUNDAYAAAA.github.io/gate/nodes.txt")
 
-def build_nodes_text(data):
+def build_nodes_text(data, edge_entries):
     """生成纯节点行版本 (无注释): 每行 = 入口地址#名字$sstp://..."""
     countries = data["countries"]
-    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
-    edge = [e.strip() for e in _entry.split(",") if e.strip()] or EDGE_HOSTS
+    edge = edge_entries or EDGE_HOSTS
     lines = []
     idx = 0
     ordered = sorted(countries.items(), key=lambda kv: (-int(kv[1].get("count") or 0), str(kv[1].get("code") or kv[0])))
@@ -330,7 +431,7 @@ def build_nodes_text(data):
             lines.append(f"{entry}#{zh}-机房-{i:02d}$sstp://vpn:vpn@{n['host']}:{n['port']}")
     return "\n".join(lines) + "\n"
 
-def write_outputs(data):
+def write_outputs(data, edge_entries=None):
     os.makedirs(PUBLIC_DIR, exist_ok=True)
     data_path = os.path.join(PUBLIC_DIR, "data.json")
     with open(data_path, "w", encoding="utf-8") as f:
@@ -349,7 +450,7 @@ def write_outputs(data):
 
     nodes_path = os.path.join(PUBLIC_DIR, "nodes.txt")
     with open(nodes_path, "w", encoding="utf-8") as f:
-        f.write(build_nodes_text(data))
+        f.write(build_nodes_text(data, edge_entries))
 
     return data_path, html_path, nodes_path
 
@@ -376,27 +477,33 @@ def main():
     log("VPN GATE", f"SSTP 节点: {sstp_count}")
     log("VPN GATE", f"去重后: {len(uniq)}")
 
-    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s)")
+    # 入口优选: 运营商API(经CF官方段验尸) 优先, 静态 EDGE_HOSTS 兜底
+    optimal = fetch_optimal_edges(session)
+    _entry = os.environ.get("HOSTS_ENTRY", "").strip()
+    manual = [e.strip() for e in _entry.split(",") if e.strip()]
+    edge_entries = manual or optimal or EDGE_HOSTS
+    log("EDGE", f"本次入口: {len(edge_entries)} 个 ({'手工HOSTS_ENTRY' if manual else '运营商优选API' if optimal and edge_entries is optimal else '静态EDGE_HOSTS'})")
+
+    log("CLOUDFLARE WORKER", f"提交检测: {len(uniq)} (并发 {CONCURRENCY}, 单请求超时 {CHECK_TIMEOUT}s, 延迟闸门 {MAX_LATENCY_MS}ms, 复测 {RECHECK_ROUNDS} 轮)")
     t0 = time.time()
-    results = check_all(uniq, session)
+    results, survivors = check_with_recheck(uniq, session)
     elapsed = time.time() - t0
 
-    success = [r for r in results if r.get("success")]
-    failed = [r for r in results if not r.get("success")]
-    worker_errors = [r for r in failed if r.get("worker_error")]
-
-    log("CLOUDFLARE WORKER", f"检测成功: {len(success)}")
-    log("CLOUDFLARE WORKER", f"检测失败: {len(failed)}" + (f" (其中 Worker 异常 {len(worker_errors)})" if worker_errors else ""))
+    worker_errors = [r for r in results if r.get("worker_error")]
+    log("CLOUDFLARE WORKER", f"过闸幸存者: {len(survivors)}")
+    log("CLOUDFLARE WORKER", f"Worker 异常: {len(worker_errors)}")
     log("CLOUDFLARE WORKER", f"耗时: {elapsed:.1f}s")
 
-    if uniq and not success and len(worker_errors) == len(uniq):
+    if uniq and not survivors and len(worker_errors) >= len(uniq):
         die("Worker 全部请求异常, 检测服务不可用 — 本次运行判定失败 (不生成空结果)")
 
     data = build_outputs(results, raw_count, sstp_count, source)
-    log("RESULT", f"可用节点: {len(success)}")
+    if not data["available"]:
+        die(f"闸门后 0 个可用节点 (闸门 {MAX_LATENCY_MS}ms/{RECHECK_ROUNDS}轮) — 拒绝生成空清单, 保留线上旧版")
+    log("RESULT", f"可用节点: {len(data['available'])}")
     log("RESULT", f"国家数量: {data['stats']['countries']}")
 
-    data_path, html_path, nodes_path = write_outputs(data)
+    data_path, html_path, nodes_path = write_outputs(data, edge_entries)
     log("WEBSITE", f"生成 {os.path.relpath(data_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(html_path, REPO_DIR)}")
     log("WEBSITE", f"生成 {os.path.relpath(nodes_path, REPO_DIR)}")
